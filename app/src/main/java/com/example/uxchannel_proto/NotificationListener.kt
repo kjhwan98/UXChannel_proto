@@ -8,9 +8,30 @@ import android.service.notification.NotificationListenerService.*
 import android.service.notification.StatusBarNotification
 import android.util.Log
 import com.google.firebase.database.FirebaseDatabase
-import com.google.firebase.firestore.FirebaseFirestore
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
 class NotificationListener : NotificationListenerService() {
+    private val notificationsMap = mutableMapOf<Int, NotificationData>()
+    private var isBound: Boolean = false
+    override fun onBind(intent: android.content.Intent): android.os.IBinder? {
+        isBound = true
+        return super.onBind(intent)
+    }
+
+    override fun onUnbind(intent: android.content.Intent): Boolean {
+        if (isBound) {
+            isBound = false
+            return super.onUnbind(intent)
+        }
+        return false
+    }
+    private fun formatDate(timestamp: Long): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+        sdf.timeZone = TimeZone.getDefault() // 서버의 시간대 설정이 필요하면 이 부분을 조정
+        return sdf.format(timestamp)
+    }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val notification = sbn.notification
@@ -18,14 +39,18 @@ class NotificationListener : NotificationListenerService() {
         val title = extras.getString(Notification.EXTRA_TITLE)
         val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
         val packageName = sbn.packageName
-        val postTime = sbn.postTime
+        val postTime = formatDate(sbn.postTime)
+
+        val data = NotificationData(title, text, postTime)
+        notificationsMap[sbn.id] = data
 
         // Firebase에 데이터 전송
         sendDataToFirebase(sbn.id, packageName, title, text, postTime)
     }
 
     @SuppressLint("HardwareIds")
-    private fun sendDataToFirebase(notificationId: Int, packageName: String, title: String?, text: String?, postTime: Long) {
+    private fun sendDataToFirebase(notificationId: Int, packageName: String, title: String?, text: String?, postTime: String) {
+        val uniqueKey = "$notificationId-$postTime"
         val notificationData = hashMapOf(
             "device_id" to Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID),
             "package_name" to packageName,
@@ -37,7 +62,7 @@ class NotificationListener : NotificationListenerService() {
 
         // Firebase Firestore에 데이터 저장
         val database = FirebaseDatabase.getInstance().getReference("notifications")
-        database.child(notificationId.toString()).setValue(notificationData)
+        database.child(uniqueKey).setValue(notificationData)
             .addOnSuccessListener {
                 Log.d("Firebase", "Data successfully written to Realtime Database.")
             }
@@ -51,10 +76,15 @@ class NotificationListener : NotificationListenerService() {
         val packageName = sbn.packageName
         val notificationId = sbn.id
         val removalReason = parseRemovalReason(reason)
-        val removalTime = System.currentTimeMillis()
+        val removalTime = formatDate(System.currentTimeMillis())
+        val notificationData = notificationsMap[notificationId]
+        val title = notificationData?.title
 
         // Firebase에 데이터 전송
-        sendRemovalDataToFirebase(notificationId, packageName, removalReason, removalTime)
+        if (title != null) {
+            sendRemovalDataToFirebase(notificationId, packageName, title, removalReason, removalTime)
+        }
+        notificationsMap.remove(notificationId)
     }
 
     private fun parseRemovalReason(reason: Int): String {
@@ -87,18 +117,20 @@ class NotificationListener : NotificationListenerService() {
     }
 
     @SuppressLint("HardwareIds")
-    private fun sendRemovalDataToFirebase(notificationId: Int, packageName: String, reason: String, removalTime: Long) {
+    private fun sendRemovalDataToFirebase(notificationId: Int, packageName: String, reason: String, title: String?, removalTime: String) {
+        val uniqueKey = "$notificationId-$removalTime"
         val removalData = hashMapOf(
             "device_id" to Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID),
             "package_name" to packageName,
             "notification_id" to notificationId,
+            "title" to title,
             "removal_reason" to reason,
             "removal_time" to removalTime
         )
 
         // Firebase Firestore에 데이터 저장
         val database = FirebaseDatabase.getInstance().getReference("notification_removals")
-        database.child(notificationId.toString()).setValue(removalData)
+        database.child(uniqueKey).setValue(removalData)
             .addOnSuccessListener {
                 Log.d("Firebase", "Removal data successfully written to Realtime Database.")
             }
