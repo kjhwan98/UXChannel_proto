@@ -49,6 +49,7 @@ class NotificationListener : NotificationListenerService() {
     private var screenOnTime: Long = 0
     private var screenOffTime: Long = 0
     private val pendingNotifications = mutableMapOf<String, StatusBarNotification>()
+    private val storedNotifications = mutableMapOf<String, StatusBarNotification>()
     private lateinit var screenOnOffReceiver: BroadcastReceiver
     private var screenOnFlag = false
 
@@ -154,9 +155,7 @@ class NotificationListener : NotificationListenerService() {
         notificationsMap[sbn.id] = data
         if (packageName == "com.kakao.talk") {
             Log.d("NotificationListener", "KakaoTalk Notification: Title=$title, Text=$text")
-            handler.postDelayed({
-                checkNotificationSeen(sbn)
-            }, 60000)
+            storedNotifications[sbn.key] = sbn
         }
         sendDataToFirebase(sbn.id, packageName, title, text, postTime)
     }
@@ -212,6 +211,7 @@ class NotificationListener : NotificationListenerService() {
         }
         // 파이어베이스에 제거된 알림 데이터 전송
         sendRemovalDataToFirebase(notificationId, packageName, title, text, removalReason, removalTime)
+        storedNotifications.remove(key)
         notificationsMap.remove(notificationId) // 맵에서 제거
     }
     // 제거 이유를 문자열로 변환
@@ -333,12 +333,19 @@ class NotificationListener : NotificationListenerService() {
 
     private fun handleScreenOff() {
         screenOnFlag = false
-
+        storedNotifications.forEach { (key, sbn) ->
+            if (!seenNotifications.containsKey(key)) {  // Only check if not already seen
+                checkNotificationSeen(sbn)
+            }
+        }
         Log.d("NotificationListener", "Handling screen off. Total seen notifications: ${seenNotifications.size}")
-        seenNotifications.forEach { (_, sbn) ->
+
+        seenNotifications.forEach { (key, sbn) ->
             if (sbn.packageName == "com.kakao.talk") {
-                cancelNotification(sbn.key)
+                cancelNotification(key)  // Cancel notifications that have been seen
                 Log.d("NotificationListener", "KakaoTalk notification canceled and pending for renotification: ${sbn.packageName}, ID: ${sbn.id}")
+                pendingNotifications[key] = sbn  // Schedule for re-notification
+                seenNotifications.clear()
             }
         }
     }
@@ -349,12 +356,16 @@ class NotificationListener : NotificationListenerService() {
             screenOnFlag = true
             // 모든 보류 중인 알림을 재전송
             pendingNotifications.forEach { (key, sbn) ->
-                handler.postDelayed({
-                    sendDelayedNotification(sbn)  // StatusBarNotification 객체를 직접 전달
-                    pendingNotifications.remove(key)
-                }, 10000)  // 10초 딜레이로 설정
+                val text = sbn.notification.extras.getCharSequence(Notification.EXTRA_TEXT)
+                if (text != null) {  // 텍스트가 null이 아닌 경우에만 재전송
+                    handler.postDelayed({
+                        sendDelayedNotification(sbn)  // StatusBarNotification 객체를 직접 전달
+                        storedNotifications.remove(key)
+                    }, 10000)
+                }// 10초 딜레이로 설정
             }
         }
+        pendingNotifications.clear()
     }
 
     override fun onDestroy() {
