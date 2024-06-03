@@ -31,6 +31,7 @@ class MainActivity : AppCompatActivity() {
         btnEnableNotificationAccess.setOnClickListener {
             if (!isNotificationServiceEnabled()) {
                 startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                Toast.makeText(this, "Please enable notification access for the app.", Toast.LENGTH_LONG).show()
             } else {
                 Toast.makeText(this, "Notification access is already enabled.", Toast.LENGTH_SHORT).show()
                 startNotificationListenerService()

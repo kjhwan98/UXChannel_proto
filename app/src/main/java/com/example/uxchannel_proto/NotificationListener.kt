@@ -1,6 +1,7 @@
 package com.example.uxchannel_proto
 
 import android.annotation.SuppressLint
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -14,10 +15,11 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
-import android.os.DeadObjectException
+import android.os.Build.VERSION_CODES.R
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
+import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.service.notification.NotificationListenerService.*
 import android.service.notification.StatusBarNotification
@@ -25,8 +27,11 @@ import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.graphics.drawable.IconCompat
+import androidx.core.graphics.drawable.toDrawable
 import com.google.firebase.database.FirebaseDatabase
+import java.text.DateFormat
 import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
@@ -36,39 +41,52 @@ class NotificationListener : NotificationListenerService() {
     private val notificationsMap = mutableMapOf<Int, NotificationData>()
     private lateinit var deviceId: String // 기기의 고유 ID
     private val notificationChannelId = "NotiServiceChannel" // 알림 채널 ID
-    private val delayedNotifications = mutableMapOf<Int, NotificationData>() // 지연된 알림을 저장하는 맵
+    private val delayedNotifications = mutableMapOf<String, StatusBarNotification>() // 지연된 알림을 저장하는 맵
     private lateinit var notificationManager: NotificationManager // 알림 관리자
     private lateinit var usageStatsManager: UsageStatsManager
     private val handler = Handler(Looper.getMainLooper()) // 핸들러 정의
-    private val seenNotifications = mutableMapOf<Int, NotificationData>() // 노티바를 본 알림을 저장하는 맵
-    private val screenOffNotifications = mutableMapOf<Int, NotificationData>() // 화면이 꺼졌을 때 저장하는 맵
-    private var lastScreenInteractive = false // 마지막 화면 상태를 저장
-    private val checkScreenStateRunnable = object : Runnable {
-        override fun run() {
-            checkScreenState()
-            handler.postDelayed(this, 1000) // 5초마다 상태를 확인
-        }
-    }
+    private val seenNotifications = mutableMapOf<String, StatusBarNotification>() // 노티바를 본 알림을 저장하는 맵
+    private var screenOnTime: Long = 0
+    private var screenOffTime: Long = 0
+    private val pendingNotifications = mutableMapOf<String, StatusBarNotification>()
+    private lateinit var screenOnOffReceiver: BroadcastReceiver
+    private var screenOnFlag = false
+
 
     @RequiresApi(Build.VERSION_CODES.Q)
     override fun onCreate() {
         super.onCreate()
+        registerScreenOnOffReceiver()
         deviceId = generateUniqueDeviceId() // 기기 ID 생성
         createNotificationChannel() // 알림 채널 생성
         startForegroundService() // 포그라운드 서비스 시작
         notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager // 알림 서비스 접근
         usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-        handler.post(checkScreenStateRunnable)
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        // Handler에 예약된 모든 콜백과 메시지 제거
-        handler.removeCallbacksAndMessages(null)
-        // 포그라운드 서비스 중지
-        stopForeground(Service.STOP_FOREGROUND_REMOVE)        // 시스템에 서비스가 종료되었음을 알리기 위해 브로드캐스트 전송
-        val restartServiceIntent = Intent("com.example.ACTION_RESTART_NOTIFICATION_LISTENER_SERVICE")
-        sendBroadcast(restartServiceIntent)
+    private fun registerScreenOnOffReceiver() {
+        screenOnOffReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_ON -> {
+                        screenOnTime = System.currentTimeMillis()
+                        handleScreenOn()
+                        Log.d("ScreenReceiver", "Screen ON")
+
+                    }
+                    Intent.ACTION_SCREEN_OFF -> {
+                        screenOffTime = System.currentTimeMillis()
+                        handleScreenOff()
+                        Log.d("ScreenReceiver", "Screen OFF")
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        registerReceiver(screenOnOffReceiver, filter)
     }
 
     @RequiresApi(Build.VERSION_CODES.O)
@@ -91,7 +109,7 @@ class NotificationListener : NotificationListenerService() {
         val notification: Notification = NotificationCompat.Builder(this, notificationChannelId)
             .setContentTitle("Notification Stats Service")
             .setContentText("Collecting notification stats")
-            .setSmallIcon(R.drawable.khu)
+            .setSmallIcon(com.example.uxchannel_proto.R.drawable.khu)
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
@@ -134,7 +152,12 @@ class NotificationListener : NotificationListenerService() {
 
         val data = NotificationData(sbn.id, title, text, postTime, icon, packageName, contentIntent)
         notificationsMap[sbn.id] = data
-        checkNotificationSeen(sbn)
+        if (packageName == "com.kakao.talk") {
+            Log.d("NotificationListener", "KakaoTalk Notification: Title=$title, Text=$text")
+            handler.postDelayed({
+                checkNotificationSeen(sbn)
+            }, 60000)
+        }
         sendDataToFirebase(sbn.id, packageName, title, text, postTime)
     }
 
@@ -167,46 +190,29 @@ class NotificationListener : NotificationListenerService() {
     // 알림이 제거될때 호출
     @RequiresApi(Build.VERSION_CODES.P)
     override fun onNotificationRemoved(sbn: StatusBarNotification, rankingMap: RankingMap, reason: Int) {
-        try {
-            if (!this::notificationManager.isInitialized) {
-                Log.w("NotificationListener", "NotificationManager is not initialized.")
-                return
-            }
+        // 알림이 제거될 때 호출
+        val packageName = sbn.packageName
+        val notificationId = sbn.id
+        val key = sbn.key
+        val removalReason = parseRemovalReason(reason) // 제거 이유
+        val removalTime = formatDate(System.currentTimeMillis())
+        val notificationData = notificationsMap[notificationId] // 기존 알림 데이터 참조
+        val title = notificationData?.title
+        val text = notificationData?.text
 
-            // 알림이 제거될 때 호출
-            val packageName = sbn.packageName
-            val notificationId = sbn.id
-            val removalReason = parseRemovalReason(reason) // 제거 이유
-            val removalTime = formatDate(System.currentTimeMillis())
-            val notificationData = notificationsMap[notificationId] // 기존 알림 데이터 참조
-            val title = notificationData?.title
-            val text = notificationData?.text
-
-            if (sbn.packageName == "com.kakao.talk" && reason == REASON_GROUP_SUMMARY_CANCELED) {
-                // 제거된 알림의 정보를 저장
-                val extractedNotificationData = extractNotificationData(sbn)
-                delayedNotifications[sbn.id] = extractedNotificationData
-
-                // 30초 후에 재전송 로직
-                handler.postDelayed({
-                    delayedNotifications[sbn.id]?.let {
-                        sendDelayedNotification(it) // 지연된 알림 재전송
-                        delayedNotifications.remove(sbn.id) // 처리 후 삭제
-                    }
-                }, 30000)  // 30초 딜레이
-            }
-
-            // 파이어베이스에 제거된 알림 데이터 전송
-            sendRemovalDataToFirebase(notificationId, packageName, title, text, removalReason, removalTime)
-            notificationsMap.remove(notificationId) // 맵에서 제거
-            seenNotifications.remove(notificationId)
-        } catch (e: DeadObjectException) {
-            Log.w("NotificationListener", "Unable to notify listener (removed): $e")
-            // DeadObjectException을 필요한 만큼 처리하거나 로깅
-        } catch (e: Exception) {
-            Log.e("NotificationListener", "Error in onNotificationRemoved: $e")
-            // 필요한 만큼 다른 예외를 처리하거나 로깅
+        if (sbn.packageName == "com.kakao.talk" && reason == REASON_GROUP_SUMMARY_CANCELED) {
+            // 제거된 알림의 정보를 저장
+            delayedNotifications[key] = sbn
+            handler.postDelayed({
+                delayedNotifications[key]?.let {
+                    sendDelayedNotification(it)
+                    delayedNotifications.remove(key)
+                }
+            }, 30000)  // 30초 딜레이
         }
+        // 파이어베이스에 제거된 알림 데이터 전송
+        sendRemovalDataToFirebase(notificationId, packageName, title, text, removalReason, removalTime)
+        notificationsMap.remove(notificationId) // 맵에서 제거
     }
     // 제거 이유를 문자열로 변환
     private fun parseRemovalReason(reason: Int): String {
@@ -265,84 +271,100 @@ class NotificationListener : NotificationListenerService() {
         }
     }
 
-    private fun extractNotificationData(sbn: StatusBarNotification): NotificationData {
-        val extras = sbn.notification.extras
-        val title = extras.getString(Notification.EXTRA_TITLE, "No Title")
-        val text = extras.getCharSequence(Notification.EXTRA_TEXT, "No Text").toString()
-        val postTime = formatDate(sbn.postTime)
-        return NotificationData(sbn.id, title, text, postTime, sbn.notification.smallIcon, sbn.packageName, sbn.notification.contentIntent)
-    }
-
-    // 지연된 알림을 다시 보내는 메소드
-    private fun sendDelayedNotification(data: NotificationData) {
+    private fun sendDelayedNotification(sbn: StatusBarNotification) {
         val channelID = "delayed_channel_id"
-        // 알림 채널이 생성되었는지 확인
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(channelID, "Delayed Notifications", NotificationManager.IMPORTANCE_DEFAULT)
             notificationManager.createNotificationChannel(channel)
         }
 
-        // 아이콘을 IconCompat로 변환
-        val iconCompat = IconCompat.createFromIcon(this, data.icon)
+        val originalNotification = sbn.notification
+        val packageName = sbn.packageName
+        val smallIcon = sbn.notification.smallIcon
+        val smallIconCompat = IconCompat.createFromIcon(this, smallIcon)
 
-        // 새 알림 구성 및 보내기
-        val newNotification = iconCompat?.let {
+
+        val title = originalNotification.extras.getString(Notification.EXTRA_TITLE) ?: "Notification"
+        val text = originalNotification.extras.getString(Notification.EXTRA_TEXT) ?: "No details available"
+        val timestamp = DateFormat.getTimeInstance().format(Date(sbn.postTime))
+        // 알림을 클릭할 때 액션 정의
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        } ?: Intent() // Fallback to an empty intent if no launch intent is found
+
+
+        val contentIntent = PendingIntent.getActivity(
+            this, sbn.id, launchIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        // 새로운 알림 생성 및 발송
+        val newNotification = smallIconCompat?.let {
             NotificationCompat.Builder(this, channelID)
-                .setContentTitle(data.title)
-                .setContentText(data.text)
-                .setSmallIcon(it)  // 변환된 IconCompat을 작은 아이콘으로 설정
-                .setContentIntent(data.contentIntent)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setSmallIcon(it) // 아이콘 설정
+                .setContentIntent(contentIntent)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .setAutoCancel(true)
+                .addExtras(Bundle().apply { putBoolean("isDelayedNotification", true) })
                 .build()
         }
-
-        notificationManager.notify(data.id, newNotification)
+        notificationManager.notify(sbn.id, newNotification)
     }
+
     private fun checkNotificationSeen(sbn: StatusBarNotification) {
-        if (sbn.packageName == "com.kakao.talk") {
-            val endTime = System.currentTimeMillis()
-            val beginTime = endTime - 1000  // 알림이 포스트되고 1초 전부터 현재까지의 이벤트를 확인
+        // 이벤트 검사를 위해 화면 꺼짐 시간을 미래의 시간으로 예측하여 설정
+        val beginTime = sbn.postTime
+        val endTime = System.currentTimeMillis()
 
-            val stats = usageStatsManager.queryEvents(beginTime, endTime)
-            val event = UsageEvents.Event()
-            while (stats.hasNextEvent()) {
-                stats.getNextEvent(event)
-                if (event.eventType == 10) { // NOTIFICATION_SEEN event type
-                    seenNotifications[sbn.id] = notificationsMap[sbn.id]!!
-                    break // Found the event, no need to continue
-                }
-            }
-        }
-    }
+        Log.d("NotificationListener", "Checking for seen notifications between ${formatDate(beginTime)} and ${formatDate(endTime)} for ${sbn.packageName}")
+        val stats = usageStatsManager.queryEvents(beginTime, endTime)
+        val event = UsageEvents.Event()
 
-    private fun checkScreenState() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        val isScreenOn = powerManager.isInteractive
-        if (lastScreenInteractive != isScreenOn) {
-            if (isScreenOn) {
-                handleScreenOn()
-            } else {
-                handleScreenOff()
+        while (stats.hasNextEvent()) {
+            stats.getNextEvent(event)
+            if (event.packageName == sbn.packageName &&
+                event.eventType == 10) {
+                seenNotifications[sbn.key] = sbn
+                Log.d("NotificationListener", "Notification seen: ID=${sbn.id}, Title=${sbn.notification.extras.getString(Notification.EXTRA_TITLE)}, Time=${formatDate(event.timeStamp)}")
+                break
             }
-            lastScreenInteractive = isScreenOn
         }
     }
 
     private fun handleScreenOff() {
-        // 화면이 꺼지면, 확인된 알림을 screenOffNotifications 맵으로 옮기고 취소
-        seenNotifications.forEach { (id, data) ->
-            notificationManager.cancel(id)
-            screenOffNotifications[id] = data
+        screenOnFlag = false
+
+        Log.d("NotificationListener", "Handling screen off. Total seen notifications: ${seenNotifications.size}")
+        seenNotifications.forEach { (_, sbn) ->
+            if (sbn.packageName == "com.kakao.talk") {
+                cancelNotification(sbn.key)
+                Log.d("NotificationListener", "KakaoTalk notification canceled and pending for renotification: ${sbn.packageName}, ID: ${sbn.id}")
+            }
         }
-        seenNotifications.clear()
     }
 
     private fun handleScreenOn() {
-        // 화면이 켜지면 screenOffNotifications에 저장된 알림을 재전송
-        screenOffNotifications.forEach { (_, data) ->
-            sendDelayedNotification(data)
+        // 화면이 켜졌을 때만 알림 재전송을 트리거하기 위해 플래그 설정
+        if (!screenOnFlag) {
+            screenOnFlag = true
+            // 모든 보류 중인 알림을 재전송
+            pendingNotifications.forEach { (key, sbn) ->
+                handler.postDelayed({
+                    sendDelayedNotification(sbn)  // StatusBarNotification 객체를 직접 전달
+                    pendingNotifications.remove(key)
+                }, 10000)  // 10초 딜레이로 설정
+            }
         }
-        screenOffNotifications.clear()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Handler에 예약된 모든 콜백과 메시지 제거
+        handler.removeCallbacksAndMessages(null)
+        // 포그라운드 서비스 중지
+        stopForeground(Service.STOP_FOREGROUND_REMOVE)
+        // 재시작 인텐트 준비
+        unregisterReceiver(screenOnOffReceiver)
     }
 
 }
